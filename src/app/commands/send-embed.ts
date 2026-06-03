@@ -1,5 +1,5 @@
 import type { ChatInputCommand, CommandData, CommandMetadata } from 'commandkit';
-import { ApplicationCommandOptionType, ChannelType, EmbedBuilder, PermissionFlagsBits } from 'discord.js';
+import { ApplicationCommandOptionType, ChannelType, EmbedBuilder } from 'discord.js';
 import { sendLog } from '@/app/utils/logger';
 
 export const metadata: CommandMetadata = {
@@ -13,7 +13,7 @@ export const command: CommandData = {
     options: [
         {
             name: 'json',
-            description: 'Вставьте JSON из конструктора (message.style). Игнорирует остальные поля, если заполнен.',
+            description: 'Вставьте JSON из конструктора (message.style). Игнорирует остальные поля.',
             type: ApplicationCommandOptionType.String,
             required: false,
         },
@@ -21,17 +21,23 @@ export const command: CommandData = {
             name: 'title',
             description: 'Заголовок объявления',
             type: ApplicationCommandOptionType.String,
-            required: false, // Сделали необязательным ради JSON режима
+            required: false,
         },
         {
             name: 'description',
-            description: 'Основной текст объявления (используйте \\n для переноса строки)',
+            description: 'Основной текст (используйте \\n для переноса строки)',
             type: ApplicationCommandOptionType.String,
-            required: false, // Сделали необязательным ради JSON режима
+            required: false,
+        },
+        {
+            name: 'mention',
+            description: 'Кого тегнуть над объявлением (например, роль или @everyone)',
+            type: ApplicationCommandOptionType.Mentionable,
+            required: false,
         },
         {
             name: 'channel',
-            description: 'Канал для отправки (если пусто — отправит в текущий)',
+            description: 'Канал для отправки (по умолчанию — текущий)',
             type: ApplicationCommandOptionType.Channel,
             channel_types: [ChannelType.GuildText, ChannelType.GuildAnnouncement],
             required: false,
@@ -51,7 +57,13 @@ export const command: CommandData = {
         },
         {
             name: 'image',
-            description: 'Ссылка на картинку (URL-адрес, заканчивающийся на .png, .jpg, .gif)',
+            description: 'Большая картинка внизу (URL-ссылка)',
+            type: ApplicationCommandOptionType.String,
+            required: false,
+        },
+        {
+            name: 'thumbnail',
+            description: 'Маленькая иконка в правом верхнем углу (URL-ссылка)',
             type: ApplicationCommandOptionType.String,
             required: false,
         }
@@ -64,17 +76,34 @@ export const chatInput: ChatInputCommand = async (ctx) => {
     const jsonInput = ctx.interaction.options.getString('json');
     const title = ctx.interaction.options.getString('title');
     const description = ctx.interaction.options.getString('description');
+    const mentionable = ctx.interaction.options.getMentionable('mention');
     const color = ctx.interaction.options.getString('color') || '#2b2d31';
     const imageUrl = ctx.interaction.options.getString('image');
+    const thumbnailUrl = ctx.interaction.options.getString('thumbnail');
 
+    // Безопасное получение целевого канала
     const resolvedChannel = ctx.interaction.options.getChannel('channel');
-    const targetChannel = resolvedChannel 
-        ? ctx.interaction.guild?.channels.cache.get(resolvedChannel.id) 
-        : ctx.interaction.channel;
+    let targetChannel: any = ctx.interaction.channel; // Временный обход строгой проверки или используем явное сужение
+
+    if (resolvedChannel) {
+        try {
+            const fetchedChannel = ctx.interaction.guild?.channels.cache.get(resolvedChannel.id) 
+                || await ctx.interaction.guild?.channels.fetch(resolvedChannel.id);
+            
+            // Проверяем, является ли канал текстовым или новостным перед присвоением
+            if (fetchedChannel && (fetchedChannel.type === ChannelType.GuildText || fetchedChannel.type === ChannelType.GuildAnnouncement)) {
+                targetChannel = fetchedChannel;
+            } else {
+                targetChannel = null;
+            }
+        } catch {
+            targetChannel = null;
+        }
+    }
 
     if (!targetChannel || (targetChannel.type !== ChannelType.GuildText && targetChannel.type !== ChannelType.GuildAnnouncement)) {
         return void await ctx.interaction.editReply({
-            content: '❌ **Ошибка:** Целевой канал не найден или не является текстовым/новостийным.'
+            content: '❌ **Ошибка:** Целевой канал не найден, не кэширован или не является текстовым/новостийным.'
         });
     }
 
@@ -85,12 +114,8 @@ export const chatInput: ChatInputCommand = async (ctx) => {
         if (jsonInput) {
             try {
                 const parsedJson = JSON.parse(jsonInput);
-                
-                // Конструкторы часто отдают объект { messages: [...] } или { embeds: [...] }
-                // Приводим к стандартному формату discord.js payload
                 messagePayload = parsedJson.messages?.[0] || parsedJson;
 
-                // Защита от пустых сообщений (должен быть либо текст, либо эмбеды)
                 if (!messagePayload.content && (!messagePayload.embeds || messagePayload.embeds.length === 0)) {
                     throw new Error('JSON должен содержать текст (content) или массив эмбедов (embeds).');
                 }
@@ -113,22 +138,42 @@ export const chatInput: ChatInputCommand = async (ctx) => {
                 .setTitle(title)
                 .setDescription(formattedDescription)
                 .setColor(color as any)
-                .setTimestamp();
+                .setTimestamp()
+                .setFooter({ 
+                    text: `Опубликовал: ${ctx.interaction.user.username}`, 
+                    iconURL: ctx.interaction.user.displayAvatarURL() 
+                });
+
+            // Функция для строгой валидации ссылок
+            const isValidUrl = (url: string) => {
+                try { return Boolean(new URL(url)); } catch { return false; }
+            };
 
             if (imageUrl) {
-                if (imageUrl.startsWith('http://') || imageUrl.startsWith('https://')) {
+                if (isValidUrl(imageUrl)) {
                     userEmbed.setImage(imageUrl);
                 } else {
-                    return void await ctx.interaction.editReply({
-                        content: '❌ **Ошибка:** Поле `image` должно содержать корректную ссылку.'
-                    });
+                    return void await ctx.interaction.editReply({ content: '❌ **Ошибка:** Неверный формат URL в поле `image`.' });
+                }
+            }
+
+            if (thumbnailUrl) {
+                if (isValidUrl(thumbnailUrl)) {
+                    userEmbed.setThumbnail(thumbnailUrl);
+                } else {
+                    return void await ctx.interaction.editReply({ content: '❌ **Ошибка:** Неверный формат URL в поле `thumbnail`.' });
                 }
             }
 
             messagePayload = { embeds: [userEmbed] };
+
+            // Если выбран кто-то для пинга — добавляем content над эмбедом
+            if (mentionable) {
+                messagePayload.content = `${mentionable}`;
+            }
         }
 
-        // Отправка сообщения от лица бота
+        // Отправка в канал
         await targetChannel.send(messagePayload);
 
         // Логирование
@@ -146,7 +191,7 @@ export const chatInput: ChatInputCommand = async (ctx) => {
     } catch (error: any) {
         await sendLog('ERROR', 'ADMIN-EMBED', `Ошибка отправки эмбеда админом ${ctx.interaction.user.tag}: ${error.message}`);
         return void await ctx.interaction.editReply({
-            content: `❌ **Не удалось отправить сообщение.** Проверьте права бота в канале или корректность структуры JSON.`
+            content: `❌ **Не удалось отправить сообщение.** Убедитесь, что у бота есть права на отправку сообщений/встраивание ссылок в этом канале, или проверьте структуру JSON.`
         });
     }
 };
