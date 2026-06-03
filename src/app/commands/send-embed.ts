@@ -19,7 +19,7 @@ export const command: CommandData = {
         },
         {
             name: 'title',
-            description: 'Заголовок объявления',
+            description: 'Заголовок объявления / Название темы на форуме',
             type: ApplicationCommandOptionType.String,
             required: false,
         },
@@ -39,7 +39,15 @@ export const command: CommandData = {
             name: 'channel',
             description: 'Канал для отправки (по умолчанию — текущий)',
             type: ApplicationCommandOptionType.Channel,
-            channel_types: [ChannelType.GuildText, ChannelType.GuildAnnouncement],
+            // Добавляем поддержку веток и форумов в список доступных типов
+            channel_types: [
+                ChannelType.GuildText, 
+                ChannelType.GuildAnnouncement,
+                ChannelType.GuildForum,
+                ChannelType.PublicThread,
+                ChannelType.PrivateThread,
+                ChannelType.AnnouncementThread
+            ],
             required: false,
         },
         {
@@ -81,17 +89,26 @@ export const chatInput: ChatInputCommand = async (ctx) => {
     const imageUrl = ctx.interaction.options.getString('image');
     const thumbnailUrl = ctx.interaction.options.getString('thumbnail');
 
+    // Разрешенные типы каналов для отправки напрямую
+    const validSendableTypes = [
+        ChannelType.GuildText,
+        ChannelType.GuildAnnouncement,
+        ChannelType.PublicThread,
+        ChannelType.PrivateThread,
+        ChannelType.AnnouncementThread
+    ];
+
     // Безопасное получение целевого канала
     const resolvedChannel = ctx.interaction.options.getChannel('channel');
-    let targetChannel: any = ctx.interaction.channel; // Временный обход строгой проверки или используем явное сужение
+    let targetChannel: any = ctx.interaction.channel;
 
     if (resolvedChannel) {
         try {
             const fetchedChannel = ctx.interaction.guild?.channels.cache.get(resolvedChannel.id) 
                 || await ctx.interaction.guild?.channels.fetch(resolvedChannel.id);
             
-            // Проверяем, является ли канал текстовым или новостным перед присвоением
-            if (fetchedChannel && (fetchedChannel.type === ChannelType.GuildText || fetchedChannel.type === ChannelType.GuildAnnouncement)) {
+            // Расширяем проверку, включая форумы и ветки
+            if (fetchedChannel && [...validSendableTypes, ChannelType.GuildForum].includes(fetchedChannel.type)) {
                 targetChannel = fetchedChannel;
             } else {
                 targetChannel = null;
@@ -101,9 +118,9 @@ export const chatInput: ChatInputCommand = async (ctx) => {
         }
     }
 
-    if (!targetChannel || (targetChannel.type !== ChannelType.GuildText && targetChannel.type !== ChannelType.GuildAnnouncement)) {
+    if (!targetChannel) {
         return void await ctx.interaction.editReply({
-            content: '❌ **Ошибка:** Целевой канал не найден, не кэширован или не является текстовым/новостийным.'
+            content: '❌ **Ошибка:** Целевой канал не найден, не кэширован или имеет неподдерживаемый тип.'
         });
     }
 
@@ -144,7 +161,6 @@ export const chatInput: ChatInputCommand = async (ctx) => {
                     iconURL: ctx.interaction.user.displayAvatarURL() 
                 });
 
-            // Функция для строгой валидации ссылок
             const isValidUrl = (url: string) => {
                 try { return Boolean(new URL(url)); } catch { return false; }
             };
@@ -167,31 +183,47 @@ export const chatInput: ChatInputCommand = async (ctx) => {
 
             messagePayload = { embeds: [userEmbed] };
 
-            // Если выбран кто-то для пинга — добавляем content над эмбедом
             if (mentionable) {
                 messagePayload.content = `${mentionable}`;
             }
         }
 
-        // Отправка в канал
-        await targetChannel.send(messagePayload);
+        // === ЛОГИКА ОТПРАВКИ В ЗАВИСИМОСТИ ОТ ТИПА КАНАЛА ===
+        let logTargetId = targetChannel.id;
+
+        if (targetChannel.type === ChannelType.GuildForum) {
+            // Форуму обязательно нужно имя темы.
+            // Берем его из параметра `title`, либо из заголовка первого эмбеда в JSON, либо ставим дефолтное
+            const threadName = title || messagePayload.embeds?.[0]?.title || messagePayload.embeds?.[0]?.data?.title || 'Новое объявление';
+
+            // Создаем публикацию (пост) на форуме
+            const forumPost = await targetChannel.threads.create({
+                name: threadName,
+                message: messagePayload,
+                reason: `Команда /send-embed от ${ctx.interaction.user.tag}`
+            });
+            logTargetId = forumPost.id;
+        } else {
+            // Обычные текстовые каналы, каналы объявлений и ветки принимают сообщения напрямую
+            await targetChannel.send(messagePayload);
+        }
 
         // Логирование
         const logDetails = jsonInput ? 'Отправлен сложный Embed через JSON' : `Заголовок: ${title}`;
         await sendLog(
             'INFO', 
             'ADMIN-EMBED', 
-            `Администратор ${ctx.interaction.user.tag} отправил объявление в <#${targetChannel.id}>\nℹ️ ${logDetails}`
+            `Администратор ${ctx.interaction.user.tag} отправил объявление в <#${logTargetId}>\nℹ️ ${logDetails}`
         );
 
         return void await ctx.interaction.editReply({
-            content: `✅ Объявление успешно отправлено в канал <#${targetChannel.id}>!`
+            content: `✅ Объявление успешно отправлено/создано в <#${logTargetId}>!`
         });
 
     } catch (error: any) {
         await sendLog('ERROR', 'ADMIN-EMBED', `Ошибка отправки эмбеда админом ${ctx.interaction.user.tag}: ${error.message}`);
         return void await ctx.interaction.editReply({
-            content: `❌ **Не удалось отправить сообщение.** Убедитесь, что у бота есть права на отправку сообщений/встраивание ссылок в этом канале, или проверьте структуру JSON.`
+            content: `❌ **Не удалось отправить сообщение.** Убедитесь, что у бота есть права на отправку сообщений/встраивание ссылок, а если это форум — право «Создавать публичные ветки» (Create Public Threads).`
         });
     }
 };
