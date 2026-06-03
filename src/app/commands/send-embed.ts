@@ -12,8 +12,8 @@ export const command: CommandData = {
     description: '📢 Создать и отправить Embed-объявление от лица бота',
     options: [
         {
-            name: 'json',
-            description: 'Вставьте JSON из конструктора (message.style). Игнорирует остальные поля.',
+            name: 'url',
+            description: 'Ссылка на общую конфигурацию из конструктора (например, Discohook). Игнорирует поля текста.',
             type: ApplicationCommandOptionType.String,
             required: false,
         },
@@ -39,7 +39,6 @@ export const command: CommandData = {
             name: 'channel',
             description: 'Канал для отправки (по умолчанию — текущий)',
             type: ApplicationCommandOptionType.Channel,
-            // Добавляем поддержку веток и форумов в список доступных типов
             channel_types: [
                 ChannelType.GuildText, 
                 ChannelType.GuildAnnouncement,
@@ -81,7 +80,7 @@ export const command: CommandData = {
 export const chatInput: ChatInputCommand = async (ctx) => {
     await ctx.interaction.deferReply({ ephemeral: true }).catch(() => null);
 
-    const jsonInput = ctx.interaction.options.getString('json');
+    const constructorUrl = ctx.interaction.options.getString('url');
     const title = ctx.interaction.options.getString('title');
     const description = ctx.interaction.options.getString('description');
     const mentionable = ctx.interaction.options.getMentionable('mention');
@@ -89,7 +88,6 @@ export const chatInput: ChatInputCommand = async (ctx) => {
     const imageUrl = ctx.interaction.options.getString('image');
     const thumbnailUrl = ctx.interaction.options.getString('thumbnail');
 
-    // Разрешенные типы каналов для отправки напрямую
     const validSendableTypes = [
         ChannelType.GuildText,
         ChannelType.GuildAnnouncement,
@@ -98,7 +96,6 @@ export const chatInput: ChatInputCommand = async (ctx) => {
         ChannelType.AnnouncementThread
     ];
 
-    // Безопасное получение целевого канала
     const resolvedChannel = ctx.interaction.options.getChannel('channel');
     let targetChannel: any = ctx.interaction.channel;
 
@@ -107,7 +104,6 @@ export const chatInput: ChatInputCommand = async (ctx) => {
             const fetchedChannel = ctx.interaction.guild?.channels.cache.get(resolvedChannel.id) 
                 || await ctx.interaction.guild?.channels.fetch(resolvedChannel.id);
             
-            // Расширяем проверку, включая форумы и ветки
             if (fetchedChannel && [...validSendableTypes, ChannelType.GuildForum].includes(fetchedChannel.type)) {
                 targetChannel = fetchedChannel;
             } else {
@@ -120,33 +116,80 @@ export const chatInput: ChatInputCommand = async (ctx) => {
 
     if (!targetChannel) {
         return void await ctx.interaction.editReply({
-            content: '❌ **Ошибка:** Целевой канал не найден, не кэширован или имеет неподдерживаемый тип.'
+            content: '❌ **Ошибка:** Целевой канал не найден или имеет неверный тип.'
         });
     }
 
     try {
         let messagePayload: any = {};
 
-        // === РЕЖИМ 1: ОТПРАВКА ЧЕРЕЗ JSON ===
-        if (jsonInput) {
+        // === РЕЖИМ 1: ПОЛУЧЕНИЕ ДАННЫХ ИЗ КОНСТРУКТОРА ПО ССЫЛКЕ ===
+        if (constructorUrl) {
             try {
-                const parsedJson = JSON.parse(jsonInput);
-                messagePayload = parsedJson.messages?.[0] || parsedJson;
+                let parsedUrl: URL;
+                try {
+                    parsedUrl = new URL(constructorUrl);
+                } catch {
+                    throw new Error('Указана некорректная ссылка.');
+                }
+
+                let apiUrl = '';
+
+                // 1. Проверка для Message Style (https://message.style/share/XXXXXX)
+                if (parsedUrl.hostname.includes('message.style')) {
+                    const paths = parsedUrl.pathname.split('/');
+                    const shareId = paths.pop() ?? paths.pop() ?? '';
+                    
+                    if (!shareId) throw new Error('Не удалось извлечь ID шаблона из ссылки Message Style.');
+                    
+                    apiUrl = `https://api.message.style/api/v1/share/${shareId}`;
+                } 
+                // 2. Проверка для Discohook (на всякий случай)
+                else if (parsedUrl.hostname.includes('discohook.app') || parsedUrl.hostname.includes('discohook.org')) {
+                    let shareId = '';
+                    if (parsedUrl.hostname.includes('discohook.app')) {
+                        const paths = parsedUrl.pathname.split('/');
+                        shareId = paths.pop() ?? '';
+                    } else {
+                        shareId = parsedUrl.searchParams.get('id') ?? '';
+                    }
+                    
+                    if (!shareId) throw new Error('Не удалось извлечь ID шаблона из ссылки Discohook.');
+                    apiUrl = `https://api.discohook.org/share/${shareId}`;
+                } else {
+                    throw new Error('Поддерживаются только ссылки из конструкторов Message Style или Discohook.');
+                }
+
+                // Делаем запрос к API конструктора
+                const response = await fetch(apiUrl);
+                if (!response.ok) {
+                    throw new Error('Не удалось получить данные с сервера конструктора. Возможно, ссылка устарела или была удалена.');
+                }
+
+                const sharedData = await response.json();
+                
+                // Унифицируем парсинг: Message Style отдаёт массив json объектов, либо объект с полем data
+                const rawPayload = sharedData.data?.messages?.[0] || sharedData.messages?.[0] || sharedData.data || sharedData;
+                
+                messagePayload = {
+                    content: rawPayload.content || null,
+                    embeds: rawPayload.embeds || []
+                };
 
                 if (!messagePayload.content && (!messagePayload.embeds || messagePayload.embeds.length === 0)) {
-                    throw new Error('JSON должен содержать текст (content) или массив эмбедов (embeds).');
+                    throw new Error('Конфигурация по ссылке пустая (нет ни текста, ни эмбедов).');
                 }
             } catch (e: any) {
                 return void await ctx.interaction.editReply({
-                    content: `❌ **Ошибка валидации JSON:** Неверный формат строки.\n\`\`\`${e.message}\`\`\``
+                    content: `❌ **Ошибка парсинга ссылки:** ${e.message}`
                 });
             }
-        } 
-        // === РЕЖИМ 2: СТАНДАРТНЫЙ КОНСТРУКТОР ===
+        }
+        // === РЕЖИМ 2: СТАНДАРТНЫЙ ВСТРОЕННЫЙ КОНСТРУКТОР ===
         else {
             if (!title || !description) {
                 return void await ctx.interaction.editReply({
-                    content: '❌ **Ошибка:** Заполните поля `title` и `description`, либо используйте поле `json`.'
+                    content: '❌ **Ошибка:** Заполните поля `title` и `description`, либо укажите ссылку в поле `url`.'
                 });
             }
 
@@ -166,19 +209,13 @@ export const chatInput: ChatInputCommand = async (ctx) => {
             };
 
             if (imageUrl) {
-                if (isValidUrl(imageUrl)) {
-                    userEmbed.setImage(imageUrl);
-                } else {
-                    return void await ctx.interaction.editReply({ content: '❌ **Ошибка:** Неверный формат URL в поле `image`.' });
-                }
+                if (isValidUrl(imageUrl)) userEmbed.setImage(imageUrl);
+                else return void await ctx.interaction.editReply({ content: '❌ **Ошибка:** Неверный формат URL в поле `image`.' });
             }
 
             if (thumbnailUrl) {
-                if (isValidUrl(thumbnailUrl)) {
-                    userEmbed.setThumbnail(thumbnailUrl);
-                } else {
-                    return void await ctx.interaction.editReply({ content: '❌ **Ошибка:** Неверный формат URL в поле `thumbnail`.' });
-                }
+                if (isValidUrl(thumbnailUrl)) userEmbed.setThumbnail(thumbnailUrl);
+                else return void await ctx.interaction.editReply({ content: '❌ **Ошибка:** Неверный формат URL в поле `thumbnail`.' });
             }
 
             messagePayload = { embeds: [userEmbed] };
@@ -188,15 +225,13 @@ export const chatInput: ChatInputCommand = async (ctx) => {
             }
         }
 
-        // === ЛОГИКА ОТПРАВКИ В ЗАВИСИМОСТИ ОТ ТИПА КАНАЛА ===
+        // === ОТПРАВКА (ТЕКСТ / ВЕТКИ / ФОРУМЫ) ===
         let logTargetId = targetChannel.id;
 
         if (targetChannel.type === ChannelType.GuildForum) {
-            // Форуму обязательно нужно имя темы.
-            // Берем его из параметра `title`, либо из заголовка первого эмбеда в JSON, либо ставим дефолтное
+            // Определяем название новой темы на форуме
             const threadName = title || messagePayload.embeds?.[0]?.title || messagePayload.embeds?.[0]?.data?.title || 'Новое объявление';
 
-            // Создаем публикацию (пост) на форуме
             const forumPost = await targetChannel.threads.create({
                 name: threadName,
                 message: messagePayload,
@@ -204,12 +239,11 @@ export const chatInput: ChatInputCommand = async (ctx) => {
             });
             logTargetId = forumPost.id;
         } else {
-            // Обычные текстовые каналы, каналы объявлений и ветки принимают сообщения напрямую
             await targetChannel.send(messagePayload);
         }
 
         // Логирование
-        const logDetails = jsonInput ? 'Отправлен сложный Embed через JSON' : `Заголовок: ${title}`;
+        const logDetails = constructorUrl ? `Отправлен эмбед по ссылке: ${constructorUrl}` : `Заголовок: ${title}`;
         await sendLog(
             'INFO', 
             'ADMIN-EMBED', 
@@ -223,7 +257,7 @@ export const chatInput: ChatInputCommand = async (ctx) => {
     } catch (error: any) {
         await sendLog('ERROR', 'ADMIN-EMBED', `Ошибка отправки эмбеда админом ${ctx.interaction.user.tag}: ${error.message}`);
         return void await ctx.interaction.editReply({
-            content: `❌ **Не удалось отправить сообщение.** Убедитесь, что у бота есть права на отправку сообщений/встраивание ссылок, а если это форум — право «Создавать публичные ветки» (Create Public Threads).`
+            content: `❌ **Не удалось отправить сообщение.** Проверьте права бота на отправку сообщений/ссылок или корректность структуры данных на сайте.`
         });
     }
 };
